@@ -72,12 +72,19 @@ export function sheetsFromPlacements(
       .filter((p) => p.sheetIndex === s)
       .slice()
       .sort((a, b) => (Math.abs(a.y - b.y) > 0.01 ? a.y - b.y : a.x - b.x))
-    const slots: Rect[] = list.map((p) => ({
-      x: p.x - m,
-      y: p.y - m,
-      w: p.w + 2 * m,
-      h: p.h + 2 * m,
-    }))
+    const slots: Rect[] = list.map((p) => {
+      const s = { x: p.x - m, y: p.y - m, w: p.w + 2 * m, h: p.h + 2 * m }
+      // 手工微调把照片贴到安全边时，刀口切块会略出可用区：
+      // 夹回可用区（与自动排样中贴边照片的切块一致），保证仍能正常拆解
+      const x = Math.max(s.x, region.x)
+      const y = Math.max(s.y, region.y)
+      return {
+        x,
+        y,
+        w: Math.min(s.x + s.w, region.x + region.w) - x,
+        h: Math.min(s.y + s.h, region.y + region.h) - y,
+      }
+    })
     // 越界检查（安全边）
     for (const p of list) {
       if (

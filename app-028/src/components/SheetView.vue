@@ -140,6 +140,9 @@ let startX = 0
 let startY = 0
 let originX = 0
 let originY = 0
+let lastX = 0
+let lastY = 0
+let moved = false
 
 function onPointerDown(ev: PointerEvent, p: Placement) {
   if (!props.draggable || props.unit !== 'px') return
@@ -151,24 +154,26 @@ function onPointerDown(ev: PointerEvent, p: Placement) {
   startY = ev.clientY
   originX = p.x
   originY = p.y
+  lastX = p.x
+  lastY = p.y
+  moved = false
   emit('select', p.seq)
 }
 
 function onPointerMove(ev: PointerEvent) {
   if (dragSeq.value < 0) return
-  emit('move', {
-    seq: dragSeq.value,
-    x: originX + (ev.clientX - startX) / props.scale,
-    y: originY + (ev.clientY - startY) / props.scale,
-  })
+  moved = true
+  lastX = originX + (ev.clientX - startX) / props.scale
+  lastY = originY + (ev.clientY - startY) / props.scale
+  emit('move', { seq: dragSeq.value, x: lastX, y: lastY })
 }
 
 function onPointerUp() {
   if (dragSeq.value < 0) return
-  const p = props.sheet.placements.find((x) => x.seq === dragSeq.value)
   const seq = dragSeq.value
   dragSeq.value = -1
-  if (p) emit('moveend', { seq, x: p.x, y: p.y })
+  // 只是点选（没有拖动）时不产生手工微调
+  if (moved) emit('moveend', { seq, x: lastX, y: lastY })
 }
 
 const headerFontSize = computed(() => {

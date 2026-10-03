@@ -3,10 +3,12 @@
  */
 import { validateCutSequence, type CutLine, type Rect } from './guillotine'
 import { BUILTIN_PAPERS, BUILTIN_PHOTO_SIZES } from './library'
+import { clampPlacement, manualGeom, rotateBlockReason, snapPlacement } from './manual'
 import { pack, sheetsFromPlacements, usableRegion, type PackGroup, type PackOptions } from './packer'
 import { buildPdf } from './pdf'
+import { resetManual, setManual } from '../store'
 import { MM_TO_PT, mmToPt, mmToPx, pxToMm } from './units'
-import type { Paper, Placement, Sheet } from './types'
+import type { Paper, Placement, Sheet, Task } from './types'
 
 export interface AssertionResult {
   id: string
@@ -482,6 +484,137 @@ function assertPerformance(): AssertionResult {
   }
 }
 
+/**
+ * ⑧ 手工微调：拖动吸附到安全边与相邻照片、夹取不出纸外、方向受限照片禁止旋转、
+ * 增量校验给出真实结论（重叠/非贯通如实判不通过）、恢复自动排样清掉派生结论且可再次微调
+ */
+function assertManualEdit(): AssertionResult {
+  const t0 = performance.now()
+  const problems: string[] = []
+
+  // —— 吸附与夹取（合成坐标：纸 100×100，留白 5，安全边 3，gap 1，kerf 0.5）——
+  const g = manualGeom({ wMm: 100, hMm: 100, marginMm: 5 }, 3, 1, 0.5)
+  const mk = (seq: number, x: number, y: number, w = 25, h = 35): Placement => ({
+    itemId: 'm',
+    sheetIndex: 0,
+    x,
+    y,
+    w,
+    h,
+    rotated: false,
+    seq,
+  })
+  const a = mk(1, 8, 8)
+  const b = mk(2, 34.5, 8)
+  // 贴安全边：拖到左上角附近应吸附到 (8, 8)
+  const s1 = snapPlacement(a, 8.6, 8.4, [b], g)
+  if (s1.x !== 8 || s1.y !== 8) problems.push(`未吸附到安全边：(${s1.x}, ${s1.y})`)
+  // 与相邻照片保持一致间隙：b 右边 1.5mm（gap+kerf）处 = 61
+  const s2 = snapPlacement(a, 61.4, 8.2, [b], g)
+  if (s2.x !== 61 || s2.y !== 8) problems.push(`未与相邻照片保持一致间隙：(${s2.x}, ${s2.y})`)
+  // 确定性：同一落点两次吸附结果必须一致
+  const s3 = snapPlacement(a, 61.4, 8.2, [b], g)
+  if (s3.x !== s2.x || s3.y !== s2.y) problems.push('同一落点两次吸附结果不一致')
+  // 夹取：拖到纸外应被夹回安全区内
+  const c1 = clampPlacement(mk(1, -50, 500), g)
+  if (c1.x < 8 - EPS || c1.y < 8 - EPS || c1.x + 25 > 92 + EPS || c1.y + 35 > 92 + EPS) {
+    problems.push('夹取后仍超出安全边')
+  }
+  const s4 = snapPlacement(a, -100, 500, [b], g)
+  if (s4.x < 8 - EPS || s4.y + 35 > 92 + EPS) problems.push('越界拖放未被夹回安全区')
+  // 旋转限制：证件照（方向要求）与任务禁转都必须拦截；放得下才允许转
+  if (rotateBlockReason(a, false, true, g) === undefined) problems.push('设方向要求的照片仍可旋转')
+  if (rotateBlockReason(a, true, false, g) === undefined) problems.push('任务禁止旋转时仍可旋转')
+  if (rotateBlockReason(mk(3, 8, 8, 60, 50), true, true, g) !== undefined) {
+    problems.push('合法旋转被误拒')
+  }
+  if (rotateBlockReason(mk(4, 8, 8, 60, 90), true, true, g) === undefined) {
+    problems.push('旋转后超出可用区却未拦截')
+  }
+
+  // —— 增量校验结论真实（在真实排样结果上微调）——
+  const paper = BUILTIN_PAPERS.find((p) => p.id === 'p5x7') as Paper
+  const opts: PackOptions = {
+    paperW: paper.wMm,
+    paperH: paper.hMm,
+    marginMm: paper.marginMm,
+    safeEdgeMm: 3,
+    gapMm: 0,
+    kerfMm: 0.5,
+    allowRotate: false,
+  }
+  const out = pack(
+    [{ itemId: 'a', copies: 8, photoW: 25, photoH: 35, allowRotate: false, keepTogether: true }],
+    opts,
+  )
+  const base = out.result.sheets.flatMap((s) => s.placements)
+  const task: Task = {
+    id: 'selftest-manual',
+    name: '自检',
+    paperId: paper.id,
+    items: [],
+    gapMm: 0,
+    kerfMm: 0.5,
+    safeEdgeMm: 3,
+    allowRotate: false,
+    headerText: '',
+    footerText: '',
+    createdAt: 0,
+    result: out.result,
+  }
+  // 合法微调：第一张贴到安全角，必须通过且刀数为真实值
+  const g2 = manualGeom(paper, 3, 0, 0.5)
+  const p0 = base[0]
+  const others = base.filter((p) => p.sheetIndex === p0.sheetIndex && p.seq !== p0.seq)
+  const snapped = snapPlacement(p0, g2.inset + 0.3, g2.inset + 0.3, others, g2)
+  const good = base.map((p) => (p.seq === p0.seq ? { ...p, x: snapped.x, y: snapped.y } : p))
+  setManual(task, good)
+  if (!task.manual?.valid) {
+    problems.push(`合法微调未通过校验：${task.manual?.message}`)
+  } else if (task.manual.stepCount <= 0) {
+    problems.push('校验通过后刀数不是真实值')
+  }
+  // 照片互相重叠必须如实判不通过
+  const bad = good.map((p, i) => (i === 1 ? { ...p, x: good[0].x, y: good[0].y } : p))
+  setManual(task, bad)
+  if (task.manual?.valid) problems.push('照片互相重叠却被判为校验通过')
+  // 非 guillotine 的风车摆位必须如实判不通过
+  const windmill: Placement[] = [
+    { itemId: 'w', sheetIndex: 0, x: 10, y: 10, w: 60, h: 20, rotated: false, seq: 1 },
+    { itemId: 'w', sheetIndex: 0, x: 70, y: 10, w: 20, h: 60, rotated: false, seq: 2 },
+    { itemId: 'w', sheetIndex: 0, x: 30, y: 70, w: 60, h: 20, rotated: false, seq: 3 },
+    { itemId: 'w', sheetIndex: 0, x: 10, y: 30, w: 20, h: 60, rotated: false, seq: 4 },
+  ]
+  const task2: Task = {
+    ...task,
+    id: 'selftest-windmill',
+    paperId: 'custom',
+    customPaper: { id: 'c100', name: '自检纸', wMm: 100, hMm: 100, marginMm: 0, priceCents: 0, kind: 'sheet' },
+    gapMm: 0,
+    kerfMm: 0,
+    safeEdgeMm: 0,
+    result: undefined,
+  }
+  setManual(task2, windmill)
+  if (task2.manual?.valid) problems.push('非贯通摆位（风车）却被判为校验通过')
+  // 恢复自动排样：派生结论全部清掉，清掉之后还能再手工调整
+  resetManual(task)
+  if (task.manual !== undefined) problems.push('恢复自动排样未清掉手工结论')
+  setManual(task, good)
+  if (!task.manual?.valid) problems.push('恢复自动排样后无法再次手工调整')
+  resetManual(task)
+
+  return {
+    id: 'manual',
+    title: '⑧ 手工微调：吸附安全边/相邻照片、不跑出纸外、校验结论真实、恢复自动排样',
+    pass: problems.length === 0,
+    detail: problems.length
+      ? problems.join('；')
+      : '吸附到安全边与相邻照片（间隙一致）且结果确定；越界拖放被夹回安全区；方向受限照片拒绝旋转；重叠/非贯通摆位如实判不通过；恢复自动排样后结论清空并可再次微调',
+    ms: Math.round(performance.now() - t0),
+  }
+}
+
 export async function runSelfTest(): Promise<AssertionResult[]> {
   const results: AssertionResult[] = []
   results.push(assertGuillotine())
@@ -501,5 +634,6 @@ export async function runSelfTest(): Promise<AssertionResult[]> {
     })
   }
   results.push(assertPerformance())
+  results.push(assertManualEdit())
   return results
 }

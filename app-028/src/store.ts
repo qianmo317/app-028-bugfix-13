@@ -164,11 +164,18 @@ export function runPack(task: Task): string | undefined {
   return undefined
 }
 
+/** 手工版面需要的相纸张数：至少与自动结果一致，且容纳所有手工摆位 */
+function manualSheetCount(task: Task, placements?: Placement[]): number {
+  const list = placements ?? task.manual?.placements ?? []
+  const maxIdx = list.reduce((a, p) => Math.max(a, p.sheetIndex + 1), 0)
+  return Math.max(1, task.result?.sheets.length ?? 1, maxIdx)
+}
+
 /** 当前生效的相纸版面：手工微调优先于自动排样 */
 export function sheetsOf(task: Task): Sheet[] {
   if (task.manual) {
     const paper = resolvePaper(task, allPapers.value)
-    const count = Math.max(1, task.result?.sheets.length ?? 1)
+    const count = manualSheetCount(task)
     return sheetsFromPlacements(task.manual.placements, optionsFromTask(task, paper), count).sheets
   }
   return task.result?.sheets ?? []
@@ -179,19 +186,36 @@ export function manualPlacementsOf(task: Task): Placement[] {
   return (task.result?.sheets ?? []).flatMap((s) => s.placements)
 }
 
-/** 写入手工微调结果并做增量校验（不重新排样） */
+/**
+ * 写入手工微调结果并做增量校验（不重新排样）。
+ * 校验结论（valid/message/validationMs/stepCount）与 placements 在同一轮写入，
+ * 切割步骤由 sheetsOf 从同一份 placements 派生，导出读取的即是刷新后的版面。
+ */
 export function setManual(task: Task, placements: Placement[]): void {
+  const paper = resolvePaper(task, allPapers.value)
+  const opts = optionsFromTask(task, paper)
+  const t0 = performance.now()
+  const { sheets, errors } = sheetsFromPlacements(placements, opts, manualSheetCount(task, placements))
+  const validationMs = Math.round((performance.now() - t0) * 10) / 10
+  const stepCount = sheets.reduce((acc, s) => acc + s.cutSteps.length, 0)
   task.manual = {
     placements,
-    valid: true,
-    message: '已手工微调',
-    validationMs: 0,
-    stepCount: 0,
+    valid: errors.length === 0,
+    message: errors.length
+      ? errors.join('；')
+      : `guillotine 校验通过：${stepCount} 刀全部贯通`,
+    validationMs,
+    stepCount,
   }
   touch()
 }
 
-export function resetManual(_task: Task): void {}
+/** 恢复自动排样：清掉手工摆位与全部派生结论（校验信息/刀数），之后可再次手工调整 */
+export function resetManual(task: Task): void {
+  if (!task.manual) return
+  task.manual = undefined
+  touch()
+}
 
 export function addCustomPaper(p: Omit<Paper, 'id'>): Paper {
   const paper: Paper = { ...p, id: newId('paper') }

@@ -17,6 +17,7 @@ import {
 } from '../store'
 import { comparePapers, computeCost } from '../logic/cost'
 import { findPhotoSize, groupsFromTask, resolvePaper, sizeLabel } from '../logic/library'
+import { clampPlacement, manualGeom, rotateBlockReason, snapPlacement } from '../logic/manual'
 import { formatCents, formatPercent } from '../logic/units'
 import type { PaperCompare } from '../logic/cost'
 import type { Placement, Task } from '../logic/types'
@@ -29,8 +30,18 @@ const activeSheet = ref(0)
 const selectedSeq = ref(-1)
 const dragState = ref<{ seq: number; x: number; y: number } | null>(null)
 const localMsg = ref('')
+const localMsgKind = ref<'info' | 'warn' | 'danger'>('info')
+
+function say(msg: string, kind: 'info' | 'warn' | 'danger' = 'info') {
+  localMsg.value = msg
+  localMsgKind.value = kind
+}
 
 const paper = computed(() => (task.value ? resolvePaper(task.value, allPapers.value) : allPapers.value[0]))
+const geom = computed(() => {
+  const t = task.value
+  return manualGeom(paper.value, t?.safeEdgeMm ?? 0, t?.gapMm ?? 0, t?.kerfMm ?? 0)
+})
 const sheets = computed(() => (task.value ? sheetsOf(task.value) : []))
 const sheet = computed(() => sheets.value[Math.min(activeSheet.value, Math.max(0, sheets.value.length - 1))])
 const cost = computed(() => (task.value?.result ? computeCost(paper.value, task.value.result) : undefined))
@@ -92,7 +103,15 @@ function runCompare() {
 }
 
 function onMove(payload: { seq: number; x: number; y: number }) {
-  dragState.value = payload
+  const t = task.value
+  const p = t ? manualPlacementsOf(t).find((q) => q.seq === payload.seq) : undefined
+  if (!p) {
+    dragState.value = payload
+    return
+  }
+  // 拖动过程中就夹取在可用区内，不允许拖出纸外
+  const c = clampPlacement({ ...p, x: payload.x, y: payload.y }, geom.value)
+  dragState.value = { seq: payload.seq, x: c.x, y: c.y }
 }
 
 function onMoveEnd(payload: { seq: number; x: number; y: number }) {
@@ -102,54 +121,80 @@ function onMoveEnd(payload: { seq: number; x: number; y: number }) {
   const list = manualPlacementsOf(t)
   const target = list.find((p) => p.seq === payload.seq)
   if (!target) return
-  const snapped = snapPosition(t, list, payload.seq, payload.x, payload.y)
+  const others = list.filter((p) => p.sheetIndex === target.sheetIndex && p.seq !== target.seq)
+  const snapped = snapPlacement(target, payload.x, payload.y, others, geom.value)
+  if (Math.abs(snapped.x - target.x) < 1e-9 && Math.abs(snapped.y - target.y) < 1e-9) return
   applyEdit(
-    list.map((p) => (p.seq === payload.seq ? { ...p, x: snapped.x, y: snapped.y } : p)),
+    list.map((p) => (p.seq === target.seq ? { ...p, x: snapped.x, y: snapped.y } : p)),
   )
-}
-
-function snapPosition(_t: Task, _list: Placement[], _seq: number, x: number, y: number) {
-  return { x, y }
 }
 
 function applyEdit(list: Placement[]) {
   const t = task.value
   if (!t) return
   setManual(t, list)
-  localMsg.value = ''
-}
-
-function clampPlacement(_t: Task, p: Placement): Placement {
-  return { ...p }
+  say('')
 }
 
 function rotateSelected() {
   const t = task.value
   if (!t) return
   if (selectedSeq.value < 0) {
-    localMsg.value = '请先在纸面上点选一张照片'
+    say('请先在纸面上点选一张照片')
     return
   }
   const list = manualPlacementsOf(t)
   const p = list.find((x) => x.seq === selectedSeq.value)
   if (!p) return
-  const next = clampPlacement(t, { ...p, w: p.h, h: p.w, rotated: !p.rotated })
+  const item = t.items.find((i) => i.id === p.itemId)
+  const reason = rotateBlockReason(p, item?.rotateAllowed ?? false, t.allowRotate, geom.value)
+  if (reason) {
+    say(reason, 'danger')
+    return
+  }
+  const next = clampPlacement({ ...p, w: p.h, h: p.w, rotated: !p.rotated }, geom.value)
   applyEdit(list.map((x) => (x.seq === p.seq ? next : x)))
 }
 
-function moveToSheet(_sheetIndex: number) {
-  localMsg.value = '暂不支持跨纸移动'
+function moveToSheet(sheetIndex: number) {
+  const t = task.value
+  if (!t) return
+  const list = manualPlacementsOf(t)
+  const p = list.find((x) => x.seq === selectedSeq.value)
+  if (!p) return
+  if (sheetIndex === p.sheetIndex || sheetIndex < 0 || sheetIndex >= sheets.value.length) return
+  const moved = { ...p, sheetIndex }
+  const others = list.filter((x) => x.sheetIndex === sheetIndex)
+  const snapped = snapPlacement(moved, moved.x, moved.y, others, geom.value)
+  applyEdit(list.map((x) => (x.seq === p.seq ? { ...moved, x: snapped.x, y: snapped.y } : x)))
+  say(`已把 #${p.seq} 移到第 ${sheetIndex + 1} 张相纸`)
 }
 
-function nudge(_dx: number, _dy: number) {
-  localMsg.value = '暂不支持微调'
+function nudge(dx: number, dy: number) {
+  const t = task.value
+  if (!t) return
+  if (selectedSeq.value < 0) {
+    say('请先在纸面上点选一张照片')
+    return
+  }
+  const list = manualPlacementsOf(t)
+  const p = list.find((x) => x.seq === selectedSeq.value)
+  if (!p) return
+  const next = clampPlacement({ ...p, x: p.x + dx, y: p.y + dy }, geom.value)
+  const blocked = Math.abs(next.x - (p.x + dx)) > 1e-9 || Math.abs(next.y - (p.y + dy)) > 1e-9
+  if (Math.abs(next.x - p.x) < 1e-9 && Math.abs(next.y - p.y) < 1e-9) {
+    say('已到安全边边界，无法继续移动', 'warn')
+    return
+  }
+  applyEdit(list.map((x) => (x.seq === p.seq ? next : x)))
+  if (blocked) say('已到安全边边界，无法继续移动', 'warn')
 }
 
 function doReset() {
   const t = task.value
   if (!t) return
   resetManual(t)
-  localMsg.value = '已恢复自动排样结果'
+  say('已恢复自动排样结果')
   selectedSeq.value = -1
 }
 
@@ -163,7 +208,7 @@ function registerWaste(w: number, h: number) {
     marginMm: 0,
     priceCents: 0,
   })
-  localMsg.value = `已登记余料 ${w.toFixed(1)}×${h.toFixed(1)}mm`
+  say(`已登记余料 ${w.toFixed(1)}×${h.toFixed(1)}mm`)
 }
 
 function registerAllWaste() {
@@ -224,7 +269,9 @@ watch(
       <button class="btn primary" @click="goto('export')">导出 1:1 →</button>
     </div>
 
-    <div v-if="localMsg" class="note">{{ localMsg }}</div>
+    <div v-if="localMsg" class="note" :class="localMsgKind === 'info' ? '' : localMsgKind">
+      {{ localMsg }}
+    </div>
     <div
       v-if="manual"
       class="note"
@@ -262,6 +309,7 @@ watch(
               :safe-edge-mm="task.safeEdgeMm"
               :scale="scale"
               draggable
+              :invalid="!!manual && !manual.valid"
               :show-cut-labels="true"
               :thumb-of="thumbs"
               @move="onMove"
