@@ -6,6 +6,7 @@ import SheetView from '../components/SheetView.vue'
 import {
   allPapers,
   allSizes,
+  effectiveResult,
   getTask,
   makePhotoResolver,
   makeThumbResolver,
@@ -28,7 +29,8 @@ const task = computed<Task | undefined>(() => getTask(String(route.params.id)))
 const paper = computed(() => (task.value ? resolvePaper(task.value, allPapers.value) : allPapers.value[0]))
 const sheets = computed(() => (task.value ? sheetsOf(task.value) : []))
 const valid = computed(() => !task.value?.manual || task.value.manual.valid)
-const cost = computed(() => (task.value?.result ? computeCost(paper.value, task.value.result) : undefined))
+const result = computed(() => (task.value ? effectiveResult(task.value) : undefined))
+const cost = computed(() => (result.value ? computeCost(paper.value, result.value) : undefined))
 const dpi = ref(300)
 const busy = ref(false)
 const message = ref('')
@@ -95,6 +97,7 @@ async function exportPng(index: number) {
       task: task.value!,
       paper: paper.value,
       sheet,
+      sheetCount: sheets.value.length,
       dpi: dpi.value,
       photoOf: photoResolver(),
       sizeLabelOf,
@@ -118,6 +121,7 @@ async function exportAllPng() {
         task: task.value!,
         paper: paper.value,
         sheet: sheets.value[i],
+        sheetCount: sheets.value.length,
         dpi: dpi.value,
         photoOf: photoResolver(),
         sizeLabelOf,
@@ -158,7 +162,7 @@ function exportCost() {
     ['照片总数', c.totalPhotoCount],
     ['总材料成本（元）', (c.totalCents / 100).toFixed(2)],
     ['每张照片摊薄成本（元）', (c.perPhotoCents / 100).toFixed(4)],
-    ['本方案利用率', formatPercent(t.result?.stats.avgUtilization ?? 0)],
+    ['本方案利用率', formatPercent(result.value?.stats.avgUtilization ?? 0)],
     ['本方案浪费率', formatPercent(c.wasteRate)],
     ['不排样逐张打印成本（元）', (c.naiveTotalCents / 100).toFixed(2)],
     ['不排样逐张打印浪费率', formatPercent(c.naiveWasteRate)],

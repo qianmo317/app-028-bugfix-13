@@ -7,6 +7,8 @@ export interface PngBuildInput {
   task: Task
   paper: Paper
   sheet: Sheet
+  /** 实际相纸总张数（手工微调后可能压掉空纸，用于页脚标注） */
+  sheetCount?: number
   dpi: number
   photoOf: (p: Placement) => { key: string; url: string } | undefined
   sizeLabelOf: (p: Placement) => string
@@ -164,7 +166,7 @@ export async function buildSheetPng(input: PngBuildInput): Promise<Blob> {
   ctx.textAlign = 'left'
   ctx.textBaseline = 'bottom'
   ctx.fillText('100mm ruler (print at 100%)', X(0), rulerY - 4 * k)
-  ctx.fillText(`Sheet ${sheet.index + 1}/${input.task.result?.sheets.length ?? 1}  ${paper.wMm}x${paper.hMm}mm`, X(104), rulerY)
+  ctx.fillText(`Sheet ${sheet.index + 1}/${input.sheetCount ?? (input.task.result?.sheets.length ?? 1)}  ${paper.wMm}x${paper.hMm}mm`, X(104), rulerY)
 
   // 页眉 / 落款
   const sizeMm = Math.max(1.6, Math.min(4, paper.marginMm * 0.5))

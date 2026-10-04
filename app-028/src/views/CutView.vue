@@ -77,6 +77,20 @@ watch(activeSheet, () => {
   step.value = 0
 })
 
+// 手工微调（含跨纸移动）可能改变纸张数或本张刀数，播放位置随之钳制
+watch(
+  () => sheets.value.length,
+  (n) => {
+    if (activeSheet.value > n - 1) {
+      activeSheet.value = Math.max(0, n - 1)
+      step.value = 0
+    }
+  },
+)
+watch(totalSteps, (n) => {
+  if (step.value > n) step.value = Math.max(0, n)
+})
+
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer)
 })

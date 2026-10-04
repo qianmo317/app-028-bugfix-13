@@ -140,6 +140,9 @@ let startX = 0
 let startY = 0
 let originX = 0
 let originY = 0
+/** 拖动中最后一次算出的毫米坐标（pointerup 时 props 里还是拖动前的位置，不能回读 props） */
+let lastX = 0
+let lastY = 0
 
 function onPointerDown(ev: PointerEvent, p: Placement) {
   if (!props.draggable || props.unit !== 'px') return
@@ -151,24 +154,30 @@ function onPointerDown(ev: PointerEvent, p: Placement) {
   startY = ev.clientY
   originX = p.x
   originY = p.y
+  lastX = p.x
+  lastY = p.y
   emit('select', p.seq)
 }
 
 function onPointerMove(ev: PointerEvent) {
   if (dragSeq.value < 0) return
+  lastX = originX + (ev.clientX - startX) / props.scale
+  lastY = originY + (ev.clientY - startY) / props.scale
   emit('move', {
     seq: dragSeq.value,
-    x: originX + (ev.clientX - startX) / props.scale,
-    y: originY + (ev.clientY - startY) / props.scale,
+    x: lastX,
+    y: lastY,
   })
 }
 
 function onPointerUp() {
   if (dragSeq.value < 0) return
-  const p = props.sheet.placements.find((x) => x.seq === dragSeq.value)
   const seq = dragSeq.value
+  const x = lastX
+  const y = lastY
   dragSeq.value = -1
-  if (p) emit('moveend', { seq, x: p.x, y: p.y })
+  // 用拖动中的真实落点通知父组件做吸附，不能从 props 读（那里还是拖动前的位置）
+  emit('moveend', { seq, x, y })
 }
 
 const headerFontSize = computed(() => {

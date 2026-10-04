@@ -7,6 +7,7 @@ import {
   addLeftover,
   allPapers,
   allSizes,
+  effectiveResult,
   getTask,
   makeThumbResolver,
   manualPlacementsOf,
@@ -17,6 +18,19 @@ import {
 } from '../store'
 import { comparePapers, computeCost } from '../logic/cost'
 import { findPhotoSize, groupsFromTask, resolvePaper, sizeLabel } from '../logic/library'
+import {
+  boundsOf,
+  clearGap,
+  clampToBounds,
+  findFreeSpot,
+  isSquare,
+  moveToSheet as movePlacementToSheet,
+  nudgePosition,
+  rotatedPlacement,
+  rotationAllowed,
+  snapPosition,
+  type AdjustContext,
+} from '../logic/manual'
 import { formatCents, formatPercent } from '../logic/units'
 import type { PaperCompare } from '../logic/cost'
 import type { Placement, Task } from '../logic/types'
@@ -33,7 +47,8 @@ const localMsg = ref('')
 const paper = computed(() => (task.value ? resolvePaper(task.value, allPapers.value) : allPapers.value[0]))
 const sheets = computed(() => (task.value ? sheetsOf(task.value) : []))
 const sheet = computed(() => sheets.value[Math.min(activeSheet.value, Math.max(0, sheets.value.length - 1))])
-const cost = computed(() => (task.value?.result ? computeCost(paper.value, task.value.result) : undefined))
+const result = computed(() => (task.value ? effectiveResult(task.value) : undefined))
+const cost = computed(() => (result.value ? computeCost(paper.value, result.value) : undefined))
 const totalPhotos = computed(() =>
   sheets.value.reduce((acc, s) => acc + s.placements.length, 0),
 )
@@ -45,14 +60,18 @@ const thumbs = computed(() => {
   return task.value ? makeThumbResolver(task.value, sheets.value) : () => undefined
 })
 
-/** 拖动中用本地覆盖，避免每帧全量校验 */
+/** 拖动中用本地覆盖，避免每帧全量校验；拖动过程中同样钳制在安全边内，不会跑出纸外 */
 const displaySheets = computed(() => {
   const list = sheets.value
   const d = dragState.value
   if (!d) return list
   return list.map((s) => ({
     ...s,
-    placements: s.placements.map((p) => (p.seq === d.seq ? { ...p, x: d.x, y: d.y } : p)),
+    placements: s.placements.map((p) =>
+      p.seq === d.seq
+        ? clampToBounds({ ...p, x: d.x, y: d.y }, boundsOf(task.value!, paper.value))
+        : p,
+    ),
   }))
 })
 const displaySheet = computed(() =>
@@ -91,36 +110,50 @@ function runCompare() {
   )
 }
 
+function adjustCtx(): AdjustContext | undefined {
+  const t = task.value
+  if (!t) return undefined
+  return {
+    paper: paper.value,
+    sizes: allSizes.value,
+    kerf: t.kerfMm,
+    gap: t.gapMm,
+    safeEdge: t.safeEdgeMm,
+  }
+}
+
+/** 屏幕上约 6px 的物理吸附半径（限制在 1~6mm），松手后吸附安全边与相邻照片 */
+function snapThresholdMm(): number {
+  return Math.min(6, Math.max(1, 6 / scale.value))
+}
+
 function onMove(payload: { seq: number; x: number; y: number }) {
+  // 拖动过程先钳制，照片任何时候都不会被拖到安全边外
   dragState.value = payload
 }
 
 function onMoveEnd(payload: { seq: number; x: number; y: number }) {
   dragState.value = null
   const t = task.value
-  if (!t) return
+  const ctx = adjustCtx()
+  if (!t || !ctx) return
   const list = manualPlacementsOf(t)
-  const target = list.find((p) => p.seq === payload.seq)
-  if (!target) return
-  const snapped = snapPosition(t, list, payload.seq, payload.x, payload.y)
-  applyEdit(
-    list.map((p) => (p.seq === payload.seq ? { ...p, x: snapped.x, y: snapped.y } : p)),
+  if (!list.some((p) => p.seq === payload.seq)) return
+  // 松手：吸附安全边 / 邻居齐平边 / 标称间隙，并钳制在纸内
+  const snapped = snapPosition(list, payload.seq, payload.x, payload.y, ctx, snapThresholdMm())
+  const next = list.map((p) =>
+    p.seq === payload.seq ? { ...p, x: snapped.x, y: snapped.y } : p,
   )
-}
-
-function snapPosition(_t: Task, _list: Placement[], _seq: number, x: number, y: number) {
-  return { x, y }
+  setManual(t, next)
+  localMsg.value = ''
 }
 
 function applyEdit(list: Placement[]) {
   const t = task.value
   if (!t) return
+  // 写入即同轮重建：版面、切割步骤、刀数、利用率与校验结论一起刷新
   setManual(t, list)
   localMsg.value = ''
-}
-
-function clampPlacement(_t: Task, p: Placement): Placement {
-  return { ...p }
 }
 
 function rotateSelected() {
@@ -133,24 +166,78 @@ function rotateSelected() {
   const list = manualPlacementsOf(t)
   const p = list.find((x) => x.seq === selectedSeq.value)
   if (!p) return
-  const next = clampPlacement(t, { ...p, w: p.h, h: p.w, rotated: !p.rotated })
+  if (!rotationAllowed(t, p)) {
+    localMsg.value = '该照片有方向要求（证件照），不允许旋转 90°'
+    return
+  }
+  if (isSquare(p)) {
+    localMsg.value = '正方形照片旋转后版面不变'
+    return
+  }
+  const next0 = rotatedPlacement(p)
+  const b = boundsOf(t, paper.value)
+  if (next0.w > b.maxX - b.minX || next0.h > b.maxY - b.minY) {
+    localMsg.value = `旋转后的 ${next0.w.toFixed(0)}×${next0.h.toFixed(0)}mm 超出可用区，不能旋转`
+    return
+  }
+  // 以中心为轴旋转并钳制回安全边内
+  const cx = p.x + p.w / 2
+  const cy = p.y + p.h / 2
+  const held = { ...next0, x: cx - next0.w / 2, y: cy - next0.h / 2 }
+  const next = clampToBounds(held, b, 3)
   applyEdit(list.map((x) => (x.seq === p.seq ? next : x)))
 }
 
-function moveToSheet(_sheetIndex: number) {
-  localMsg.value = '暂不支持跨纸移动'
+function moveToSheet(targetSheet: number) {
+  const t = task.value
+  const ctx = adjustCtx()
+  if (!t || !ctx) return
+  if (selectedSeq.value < 0) {
+    localMsg.value = '请先在纸面上点选一张照片'
+    return
+  }
+  const list = manualPlacementsOf(t)
+  const p = list.find((x) => x.seq === selectedSeq.value)
+  if (!p || p.sheetIndex === targetSheet) return
+  // 目标纸上先找一块不压住别人的空位；找不到时给真实结论，而不是一句空话
+  const spot = findFreeSpot(list, targetSheet, p.w, p.h, ctx)
+  if (!spot) {
+    localMsg.value = `第 ${targetSheet + 1} 张纸上没有能放下这张照片、又不与其它照片相压的空位`
+    return
+  }
+  const moved = movePlacementToSheet(list, p.seq, targetSheet, ctx)
+  if (!moved) return
+  applyEdit(moved.list)
+  // 跨纸移动真正生效：切换到目标纸并保持选中
+  const landed = moved.list.find((x) => x.seq === p.seq)
+  activeSheet.value = landed?.sheetIndex ?? targetSheet
+  localMsg.value = `已移到第 ${activeSheet.value + 1} 张相纸，与相邻照片保持 ${clearGap(ctx).toFixed(1)}mm 净间距`
 }
 
-function nudge(_dx: number, _dy: number) {
-  localMsg.value = '暂不支持微调'
+function nudge(dx: number, dy: number) {
+  const t = task.value
+  const ctx = adjustCtx()
+  if (!t || !ctx) return
+  if (selectedSeq.value < 0) {
+    localMsg.value = '请先在纸面上点选一张照片'
+    return
+  }
+  const list = manualPlacementsOf(t)
+  if (!list.some((x) => x.seq === selectedSeq.value)) return
+  // 精确步进（不做吸附），始终钳制在安全边内；若压住邻居则由校验给出真实结论
+  const { x, y } = nudgePosition(list, selectedSeq.value, dx, dy, ctx)
+  applyEdit(list.map((p) => (p.seq === selectedSeq.value ? { ...p, x, y } : p)))
 }
 
 function doReset() {
   const t = task.value
   if (!t) return
+  // 恢复自动排样：手工摆位与派生结论（切割步骤/刀数/校验）一并清除
   resetManual(t)
-  localMsg.value = '已恢复自动排样结果'
+  localMsg.value = '已恢复自动排样结果，可重新拖动或旋转进行手工调整'
   selectedSeq.value = -1
+  dragState.value = null
+  activeSheet.value = 0
 }
 
 function registerWaste(w: number, h: number) {
@@ -178,7 +265,12 @@ function selectedInfo() {
   const p = manualPlacementsOf(t).find((x) => x.seq === selectedSeq.value)
   if (!p) return undefined
   const item = t.items.find((i) => i.id === p.itemId)
-  return { p, item, size: item ? findPhotoSize(allSizes.value, item.sizeId) : undefined }
+  return {
+    p,
+    item,
+    size: item ? findPhotoSize(allSizes.value, item.sizeId) : undefined,
+    canRotate: rotationAllowed(t, p) && !isSquare(p),
+  }
 }
 
 const info = computed(selectedInfo)
@@ -205,6 +297,14 @@ watch(
   },
   { immediate: true },
 )
+
+// 跨纸移动压掉空纸后，保证当前查看的纸张编号始终有效
+watch(
+  () => sheets.value.length,
+  (n) => {
+    if (activeSheet.value > n - 1) activeSheet.value = Math.max(0, n - 1)
+  },
+)
 </script>
 
 <template>
@@ -224,16 +324,14 @@ watch(
       <button class="btn primary" @click="goto('export')">导出 1:1 →</button>
     </div>
 
-    <div v-if="localMsg" class="note">{{ localMsg }}</div>
+    <div v-if="localMsg" class="note" :class="manual && !manual.valid ? 'warn' : 'ok'">{{ localMsg }}</div>
     <div
       v-if="manual"
       class="note"
       :class="manual.valid ? 'ok' : 'danger'"
     >
       手工微调：{{ manual.message }}
-      <template v-if="manual.valid">
-        （增量校验 {{ manual.validationMs }}ms，共 {{ manual.stepCount }} 刀）
-      </template>
+      （增量校验 {{ manual.validationMs }}ms，共 {{ manual.stepCount }} 刀）
       <button class="btn small" style="margin-left: 8px" @click="doReset">恢复自动排样</button>
     </div>
 
@@ -321,13 +419,13 @@ watch(
           />
           <div style="height: 10px"></div>
           <UtilizationBar
-            :value="task.result ? task.result.stats.avgUtilization : 0"
+            :value="result ? result.stats.avgUtilization : 0"
             label="整单平均利用率"
             :detail="`${sheets.length} 张相纸，共 ${totalPhotos} 张照片`"
           />
           <div class="kv" style="margin-top: 12px">
             <dt>排样耗时</dt>
-            <dd>{{ task.result ? task.result.stats.elapsedMs + ' ms' : '—' }}</dd>
+            <dd>{{ result ? result.stats.elapsedMs + ' ms' : '—' }}</dd>
             <dt>切割步数（已合并）</dt>
             <dd>{{ totalSteps }}</dd>
             <dt>切割步数（未合并）</dt>
@@ -398,9 +496,13 @@ watch(
               <dd>{{ info.p.x.toFixed(1) }} / {{ info.p.y.toFixed(1) }} mm</dd>
               <dt>尺寸</dt>
               <dd>{{ info.p.w.toFixed(1) }}×{{ info.p.h.toFixed(1) }} mm</dd>
+              <dt>方向</dt>
+              <dd>{{ info.canRotate ? '允许旋转' : '有方向要求，不可旋转' }}</dd>
             </div>
             <div class="row">
-              <button class="btn small" @click="rotateSelected">旋转 90°</button>
+              <button class="btn small" :disabled="!info.canRotate" @click="rotateSelected">
+                旋转 90°
+              </button>
               <button class="btn small" @click="nudge(-1, 0)">← 1mm</button>
               <button class="btn small" @click="nudge(1, 0)">→ 1mm</button>
               <button class="btn small" @click="nudge(0, -1)">↑ 1mm</button>
@@ -415,6 +517,7 @@ watch(
                 @change="moveToSheet(Number(($event.target as HTMLSelectElement).value))"
               >
                 <option v-for="(_, i) in sheets" :key="i" :value="i">第 {{ i + 1 }} 张</option>
+                <option :value="sheets.length">＋ 另起一张新相纸</option>
               </select>
             </label>
           </div>

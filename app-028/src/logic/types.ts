@@ -128,6 +128,8 @@ export interface Task {
   /** 手工微调过的排样（存在时优先于自动排样结果） */
   manual?: {
     placements: Placement[]
+    /** 由 placements 同轮重建出的每张相纸（切割步骤、利用率、余料随校验一起刷新） */
+    sheets: Sheet[]
     valid: boolean
     message: string
     validationMs: number
